@@ -6,8 +6,10 @@ from __future__ import annotations
 
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml.ns import qn
 
 from html_to_pptx import converter as C
+from html_to_pptx import render_pptx
 from html_to_pptx.css_values import blend_over
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,17 @@ def test_omitted_gradient_positions_interpolate_between_known_ones():
         "linear-gradient(rgb(0, 0, 0), rgb(1, 1, 1) 20%, rgb(2, 2, 2), rgb(3, 3, 3), rgb(4, 4, 4))"
     )
     assert [round(pos, 3) for _, pos, _ in stops] == [0.0, 0.2, 0.467, 0.733, 1.0]
+
+
+def test_interpolated_gradient_positions_round_to_the_nearest_ooxml_unit():
+    prs = render_pptx([{"elements": [{
+        "tag": "div", "x": 0, "y": 0, "width": 600, "height": 200, "text": "",
+        "backgroundColor": None, "children": [],
+        "backgroundImage": "linear-gradient(90deg, rgb(255, 0, 0), rgb(0, 255, 0) 30%, "
+                           "rgb(255, 255, 0), rgb(0, 0, 255))",
+    }]}])
+    stops = prs.slides[0].shapes[0]._element.findall(".//" + qn("a:gs"))
+    assert [gs.get("pos") for gs in stops] == ["0", "30000", "65000", "100000"]
 
 
 def test_gradient_angle_units():

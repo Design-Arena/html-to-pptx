@@ -7,6 +7,7 @@ import io
 
 import pytest
 from PIL import Image
+from pptx.enum.dml import MSO_FILL
 from pptx.oxml.ns import qn
 
 from html_to_pptx import extract_measurements, render_pptx
@@ -30,7 +31,7 @@ def _decode(data_uri: str) -> Image.Image:
 
 
 async def test_every_slide_is_found(fidelity_measurements):
-    assert len(fidelity_measurements) == 4
+    assert len(fidelity_measurements) == 5
 
 
 async def test_grid_slide_keeps_its_columns(fidelity_measurements):
@@ -105,6 +106,46 @@ async def test_fidelity_deck_renders_with_effects(fidelity_measurements, tmp_pat
     assert b'spc="200"' in xml
     assert b"NEW FEATURE" in xml
     assert prs.slides[1].notes_slide.notes_text_frame.text == "Say hello to the board."
+
+
+async def test_preformatted_whitespace_is_kept_and_normal_whitespace_collapses(fidelity_measurements):
+    slide = fidelity_measurements[4]
+    assert _with_text(slide, "A  B")["text"] == "  A  B  "
+    nested = _find(slide, lambda el: any(run["text"] == "  bold  " for run in el.get("inlineRuns") or []))
+    assert "".join(run["text"] for run in nested["inlineRuns"]) == "  x   bold   y  "
+    assert _with_text(slide, "collapsed")["text"] == "collapsed text\u00a0\u00a0kept"
+    code = _find(slide, lambda el: el.get("tag") == "pre")
+    assert [run["text"] for run in code["inlineRuns"]] == ["def f():", "\n", "    return 1"]
+    byline = _find(slide, lambda el: any(run["text"] == "Dr. Amna" for run in el.get("inlineRuns") or []))
+    assert [run["text"] for run in byline["inlineRuns"]] == ["Presented by ", "Dr. Amna", "\n", "Resident"]
+
+
+async def test_visually_hidden_text_is_not_extracted(fidelity_measurements):
+    texts = "".join(el.get("text") or "" for el in walk_elements(fidelity_measurements[4]["elements"]))
+    assert "Skip to content" not in texts
+    assert "Hidden label" not in texts
+
+
+async def test_positive_thin_rules_survive_and_empty_boxes_do_not(fidelity_measurements):
+    slide = fidelity_measurements[4]
+    rules = [el for el in walk_elements(slide["elements"]) if el.get("backgroundColor") == "rgb(255, 0, 0)"]
+    extents = sorted((el["width"], el["height"]) for el in rules)
+    assert extents == [(0.5, 200), (1, 200), (200, 0.5), (200, 1), (200, 2)]
+
+    prs = render_pptx([slide])
+    red_shapes = [
+        s for s in prs.slides[0].shapes
+        if s.fill.type == MSO_FILL.SOLID and s.fill.fore_color.rgb == (255, 0, 0)
+    ]
+    assert len(red_shapes) == 5
+
+
+async def test_preformatted_text_survives_render(fidelity_measurements):
+    shapes = render_pptx([fidelity_measurements[4]]).slides[0].shapes
+    texts = [s.text_frame.text for s in shapes if s.has_text_frame and s.text_frame.text]
+    assert "  A  B  " in texts
+    assert "  x   bold   y  " in texts
+    assert "def f():\n    return 1" in texts
 
 
 async def test_decks_without_slide_class_fall_back_to_sections(tmp_path):

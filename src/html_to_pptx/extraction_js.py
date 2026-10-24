@@ -38,6 +38,11 @@ EXTRACTION_JS = r"""
     const BLUR_EXTENT_PER_RADIUS = 3;
     const MAX_PAINT_OVERFLOW_PX = 400;
     const DECK_CONTAINER_SELECTOR = '#deck, .deck, .slides, .reveal, .slides-container, .deck-container';
+    // CSS collapsible whitespace. Unlike \s (and String.trim) it excludes
+    // no-break spaces, which CSS never collapses.
+    const CSS_SPACE_RUN = /[ \t\n\r\f]+/g;
+    // `clip` on the screen-reader-only pattern; it paints nothing at all.
+    const ZERO_CLIP = 'rect(0px, 0px, 0px, 0px)';
     const SUBTREE_ATTR = 'data-pptx-isolate';
     const PAINT_ATTR = 'data-pptx-isolate-paint';
     // While one element carries an isolation attribute everything else stops
@@ -272,45 +277,55 @@ EXTRACTION_JS = r"""
         };
     }
 
-    function getDirectText(el) {
-        let text = '';
+    // 'preserve' keeps spaces and newlines (pre, pre-wrap, break-spaces),
+    // 'breaks' keeps only newlines (pre-line), 'collapse' keeps neither.
+    function whitespaceMode(style) {
+        if (style.whiteSpace === 'pre-line') return 'breaks';
+        if (style.whiteSpace.startsWith('pre') || style.whiteSpace === 'break-spaces') return 'preserve';
+        return 'collapse';
+    }
+
+    // Text as the browser renders it, before trimming at the element's edges.
+    function renderedText(text, mode) {
+        if (mode === 'preserve') return text;
+        if (mode === 'breaks') return text.replace(/[ \t]*\n[ \t]*/g, '\n').replace(/[ \t]+/g, ' ');
+        return text.replace(CSS_SPACE_RUN, ' ');
+    }
+
+    function getDirectText(el, mode) {
+        const parts = [];
         for (const node of el.childNodes) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                const t = node.textContent.trim();
-                if (t) text += (text ? ' ' : '') + t;
-            }
+            if (node.nodeType === Node.TEXT_NODE) parts.push(renderedText(node.textContent, mode));
         }
-        return text;
+        if (mode === 'preserve') return parts.join('');
+        return parts.map(p => p.replace(/^ | $/g, '')).filter(Boolean).join(' ');
     }
 
     function collectInlineRuns(el) {
         const runs = [];
         const parentStyle = getComputedStyle(el);
         const parentRun = runStyle(parentStyle);
+        const parentMode = whitespaceMode(parentStyle);
         const lineBreak = () => ({ ...parentRun, text: '\n', textTransform: 'none' });
-        const pre = parentStyle.whiteSpace && parentStyle.whiteSpace.indexOf('pre') === 0;
+        // Preserved newlines become '\n' runs, which render as paragraph breaks.
+        const pushText = (text, run) => {
+            text.split('\n').forEach((segment, i) => {
+                if (i > 0) runs.push(lineBreak());
+                if (segment) runs.push({ ...run, text: segment });
+            });
+        };
         const nodes = el.childNodes;
         for (let ni = 0; ni < nodes.length; ni++) {
             const node = nodes[ni];
             if (node.nodeType === Node.TEXT_NODE) {
-                // In white-space:pre*, newlines and runs of spaces are significant
-                // (e.g. a terminal/code block). Preserve them: emit '\n' runs at
-                // line breaks and keep the raw text (including indentation).
-                if (pre) {
-                    const segs = node.textContent.split('\n');
-                    for (let si = 0; si < segs.length; si++) {
-                        if (si > 0) runs.push(lineBreak());
-                        if (segs[si].length) runs.push({ ...parentRun, text: segs[si] });
-                    }
-                    continue;
+                // Collapsed spaces survive between inline siblings but not at the
+                // element's edges.
+                let t = renderedText(node.textContent, parentMode);
+                if (parentMode !== 'preserve') {
+                    if (ni === 0) t = t.replace(/^ /, '');
+                    if (ni === nodes.length - 1) t = t.replace(/ $/, '');
                 }
-                // Collapse internal whitespace runs to single spaces (browser behavior)
-                // but preserve boundary spaces between inline siblings
-                let t = node.textContent.replace(/\s+/g, ' ');
-                if (ni === 0) t = t.replace(/^\s+/, '');
-                if (ni === nodes.length - 1) t = t.replace(/\s+$/, '');
-                if (!t) continue;
-                runs.push({ ...parentRun, text: t });
+                pushText(t, parentRun);
             } else if (node.nodeType === Node.ELEMENT_NODE) {
                 const tag = node.tagName.toLowerCase();
                 if (SKIP_TAGS.has(tag)) continue;
@@ -322,14 +337,15 @@ EXTRACTION_JS = r"""
                 }
                 const isInline = cs.display.startsWith('inline') || INLINE_TAGS.has(tag);
                 if (isInline) {
-                    const text = node.textContent.trim();
+                    const mode = whitespaceMode(cs);
+                    let text = renderedText(node.textContent, mode);
+                    if (mode !== 'preserve') text = text.replace(/^ | $/g, '');
                     if (text) {
                         const childBgImage = cs.backgroundImage !== 'none' ? cs.backgroundImage : null;
                         const childFillColor = cs.webkitTextFillColor || '';
                         const childIsGradientText = (childFillColor === 'transparent' || childFillColor === 'rgba(0, 0, 0, 0)') && childBgImage && childBgImage.includes('gradient');
-                        runs.push({
+                        pushText(text, {
                             ...runStyle(cs),
-                            text: text,
                             href: tag === 'a' ? node.getAttribute('href') : null,
                             isGradientText: childIsGradientText,
                             backgroundImage: childIsGradientText ? childBgImage : null,
@@ -357,7 +373,7 @@ EXTRACTION_JS = r"""
         const psBg = ps.backgroundColor !== 'rgba(0, 0, 0, 0)' && ps.backgroundColor !== 'transparent';
         const pw = parseFloat(ps.width) || 0;
         const ph = parseFloat(ps.height) || 0;
-        if (pw < 1 || ph < 1) return null;
+        if (pw <= 0 || ph <= 0) return null;
 
         let px = relX, py = relY;
         const pt = parseFloat(ps.top); const pl = parseFloat(ps.left);
@@ -415,11 +431,18 @@ EXTRACTION_JS = r"""
         const relX = rect.left - slideRect.left;
         const relY = rect.top - slideRect.top;
 
-        if (rect.width < 1 || rect.height < 1) return null;
+        if (rect.width <= 0 || rect.height <= 0) return null;
         if (relX + rect.width <= 0 || relY + rect.height <= 0) return null;
         if (relX >= slideRect.width || relY >= slideRect.height) return null;
 
-        let directText = getDirectText(el);
+        // Visually-hidden text (the sr-only pattern) stays in the DOM but never
+        // paints: a zero `clip`, or overflow clipped to a box at most a pixel wide.
+        const isPositioned = style.position === 'absolute' || style.position === 'fixed';
+        if (isPositioned && style.clip === ZERO_CLIP) return null;
+        const clipsContent = (style.overflowX !== 'visible' && rect.width <= 1)
+            || (style.overflowY !== 'visible' && rect.height <= 1);
+
+        let directText = clipsContent ? '' : getDirectText(el, whitespaceMode(style));
         const tag = el.tagName.toLowerCase();
 
         let markerColor = null;
@@ -521,14 +544,15 @@ EXTRACTION_JS = r"""
             ? [null, null]
             : PSEUDOS.map(p => measurePseudo(el, p, relX, relY, rect));
         if (pseudoData[0]) data.children.push(pseudoData[0]);
-        for (const child of el.children) {
+        for (const child of clipsContent ? [] : el.children) {
             if (isSkipped(child)) continue;
             const childData = measureElement(child, slideRect, depth + 1);
             if (childData) data.children.push(childData);
         }
         if (pseudoData[1]) data.children.push(pseudoData[1]);
 
-        if (directText && hasChildElementText(el)) {
+        // Preserved newlines need paragraph breaks, which only runs carry.
+        if (directText && (hasChildElementText(el) || directText.includes('\n'))) {
             const runs = collectInlineRuns(el);
             if (runs.length > 0) {
                 if (markerPrefix) {

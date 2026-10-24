@@ -32,6 +32,7 @@
   .quote { position: absolute; left: 900px; top: 100px; font-size: 40px; padding-left: 60px; }
   .quote::before { content: "\201C"; position: absolute; left: 0; top: -20px; font-size: 120px; color: rgb(250, 204, 21); }
   canvas { position: absolute; left: 900px; top: 300px; }
+  .thin-rule { position: absolute; background: rgb(255, 0, 0); }
 </style>
 </head>
 <body>
@@ -55,6 +56,22 @@
   <canvas id="chart" width="300" height="200"></canvas>
   <img id="webp" src="data:image/webp;base64,UklGRhwAAABXRUJQVlA4TA8AAAAvD8ADAAdQ5Ij+ByKi/wEA"
        style="position:absolute; left:1400px; top:300px; width:200px; height:200px;">
+</section>
+<section class="slide">
+  <span style="position:absolute; left:100px; top:100px; font-size:40px; white-space:pre">  A  B  </span>
+  <div style="position:absolute; left:100px; top:200px; font-size:40px; white-space:pre">  x <b>  bold  </b> y  </div>
+  <span style="position:absolute; left:100px; top:300px; font-size:40px">   collapsed   text&nbsp;&nbsp;kept   </span>
+  <pre style="position:absolute; left:100px; top:400px; font-size:30px">def f():
+    return 1</pre>
+  <div style="position:absolute; left:100px; top:600px; font-size:30px">Presented by <b>Dr. Amna</b><br>Resident</div>
+  <span style="position:absolute; width:1px; height:1px; margin:-1px; overflow:hidden; clip:rect(0,0,0,0)">Skip to content</span>
+  <span style="position:absolute; left:0; top:0; width:1px; height:1px; overflow:hidden">Hidden label</span>
+  <div class="thin-rule" style="left:1000px; top:100px; width:200px; height:2px"></div>
+  <div class="thin-rule" style="left:1000px; top:150px; width:200px; height:1px"></div>
+  <div class="thin-rule" style="left:1000px; top:200px; width:200px; height:0.5px"></div>
+  <div class="thin-rule" style="left:1300px; top:100px; width:1px; height:200px"></div>
+  <div class="thin-rule" style="left:1350px; top:100px; width:0.5px; height:200px"></div>
+  <div class="thin-rule" style="left:1400px; top:100px; width:0; height:200px"></div>
 </section>
 <script>
   const ctx = document.getElementById('chart').getContext('2d');

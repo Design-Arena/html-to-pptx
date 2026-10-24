@@ -302,7 +302,7 @@ def _apply_gradient_fill(xml_ancestor, css_val: str, backdrop: RGBColor | None =
 
     for color, pos, alpha in stops:
         gs = etree.SubElement(gs_lst, qn("a:gs"))
-        gs.set("pos", str(int(pos * 100000)))
+        gs.set("pos", str(round(pos * 100000)))
         srgb = etree.SubElement(gs, qn("a:srgbClr"))
         srgb.set("val", f"{color[0]:02X}{color[1]:02X}{color[2]:02X}")
         if alpha < 0.99:
@@ -340,7 +340,7 @@ def _apply_gradient_text(run, css_val: str) -> bool:
     gs_lst = etree.SubElement(grad, qn("a:gsLst"))
     for color, pos, alpha in stops:
         gs = etree.SubElement(gs_lst, qn("a:gs"))
-        gs.set("pos", str(int(pos * 100000)))
+        gs.set("pos", str(round(pos * 100000)))
         srgb = etree.SubElement(gs, qn("a:srgbClr"))
         srgb.set("val", f"{color[0]:02X}{color[1]:02X}{color[2]:02X}")
 
@@ -1227,7 +1227,9 @@ def _render_text_element(
     if el.get("isGradientText"):
         has_visual_bg = False
 
-    text = el["text"].strip()
+    # Extraction already applied the element's white-space mode, so boundary
+    # spaces here are significant (white-space: pre).
+    text = el["text"]
 
     transform = el.get("textTransform", "none")
     if transform == "uppercase":
@@ -1454,7 +1456,7 @@ def _render_inline_runs(
         total_in = 0.0
         for rd in runs_data:
             t = rd.get("text", "")
-            if not t.strip():
+            if not t or t == "\n":
                 continue
             tr = rd.get("textTransform", "none")
             t = t.upper() if tr == "uppercase" else t.lower() if tr == "lowercase" else t.title() if tr == "capitalize" else t
@@ -1485,7 +1487,7 @@ def _render_inline_runs(
             p.alignment = alignment
             _apply_line_spacing(p, el)
             continue
-        if not text.strip():
+        if not text:
             continue
 
         transform = run_data.get("textTransform", "none")
@@ -1577,7 +1579,8 @@ def _render_measured_element(
     w_in = min(w_in, SLIDE_WIDTH_INCHES - x_in)
     h_in = min(h_in, SLIDE_HEIGHT_INCHES - y_in)
 
-    if w_in < 0.01 or h_in < 0.01:
+    # A 1 CSS px rule is under 0.01in, so only empty boxes are dropped.
+    if w_in <= 0 or h_in <= 0:
         return
 
     is_image = el.get("isImage", False)
