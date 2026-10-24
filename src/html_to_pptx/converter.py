@@ -8,24 +8,30 @@ This module has no Agon framework dependencies and can be used standalone.
 
 Pipeline:
   1. Load the HTML in headless Chromium via Playwright
-  2. For each <section class="slide">, measure every visible element's
-     bounding box, computed styles, text content, and image data
-  3. Rasterize inline <svg> elements to PNG via Playwright screenshots
+  2. For each slide (``.slide``, reveal.js sections, bare ``<section>``),
+     measure every visible element's bounding box, computed styles, text
+     content, and image data (extraction_js.py)
+  3. Screenshot paint PPTX can't express natively — SVG, canvas, WebP/remote
+     images, radial/conic/layered/url() backgrounds, filters — in isolation
+     (raster.py)
   4. Map each measurement to a python-pptx shape: text boxes, picture
-     shapes, gradient fills, rounded rectangles, and translucent overlays
+     shapes, gradient fills, rounded rectangles, shadows, and borders
   5. Save the Presentation as a .pptx file
 
 Supported HTML features:
-  - CSS linear-gradient backgrounds (solid, transparent stops, any angle)
+  - CSS linear-gradient backgrounds (stop positions, transparent stops, any angle)
+  - Everything else a browser can paint, as pixel-exact pictures behind
+    native, editable text
   - Gradient text fill (-webkit-background-clip: text) → PPTX gradient run
-  - Inline <svg> icons → rasterized PNG pictures
   - Rounded corners on images and shapes (border-radius, including %)
+  - box-shadow → native outer shadow; per-side borders and dividers
   - Translucent overlays (rgba backgrounds with alpha)
-  - Mixed inline content (<p>text <strong>bold</strong> more</p>)
+  - Mixed inline content (<p>text <strong>bold</strong> more</p>), letter-spacing,
+    underline and strike-through
   - RTL text direction
   - List markers (bullets and ordered numbers)
   - CSS pseudo-elements (::before/::after) for decorative accents
-  - Border-left accent bars
+  - Speaker notes (``data-pptx-notes`` or reveal.js ``<aside class="notes">``)
 
 The HTML canvas is fixed at 1920×1080 CSS pixels. Measurements are
 converted to PowerPoint's coordinate system (13.333 × 7.5 inches).
@@ -52,43 +58,54 @@ Requirements:
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import os
 import re
-import tempfile
 
 from lxml import etree
+from PIL import Image, UnidentifiedImageError
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.dml import MSO_LINE_DASH_STYLE
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
+
+from .css_values import (
+    RGB_RE,
+    blend_over,
+    css_color_to_rgb,
+    rgb_match_to_color,
+    split_top_level,
+)
+from .effects import (
+    apply_element_shadow,
+    apply_run_typography,
+    claim_top_border,
+    mark_left_border_drawn,
+    render_side_borders,
+    suppress_theme_shadows,
+)
+from .extraction_js import EXTRACTION_JS
+from .measurement_tree import count_elements, walk_elements
+from .raster import rasterize_marked_elements
+from .units import (
+    CSS_PX_TO_PT,
+    PIXELS_TO_INCHES_X,
+    PIXELS_TO_INCHES_Y,
+    SLIDE_CANVAS_HEIGHT_PX,
+    SLIDE_CANVAS_WIDTH_PX,
+    SLIDE_HEIGHT_INCHES,
+    SLIDE_WIDTH_INCHES,
+)
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# Standard widescreen slide dimensions (16:9)
-SLIDE_WIDTH_INCHES = 13.333
-SLIDE_HEIGHT_INCHES = 7.5
-
-# HTML canvas dimensions — the deck is authored at this fixed resolution
-SLIDE_CANVAS_WIDTH_PX = 1920
-SLIDE_CANVAS_HEIGHT_PX = 1080
-
-# px-to-inch conversion: Playwright reports CSS pixels, PPTX uses inches
-PIXELS_TO_INCHES_X = SLIDE_WIDTH_INCHES / SLIDE_CANVAS_WIDTH_PX
-PIXELS_TO_INCHES_Y = SLIDE_HEIGHT_INCHES / SLIDE_CANVAS_HEIGHT_PX
-
-# Font size scaling: CSS px -> PowerPoint pt, adjusted for the same
-# layout scale as position coordinates so text proportions match.
-# 96 CSS px = 1 inch at standard DPI; the ratio ensures font sizes
-# and element positions use the same scale factor.
-_LAYOUT_SCALE = SLIDE_WIDTH_INCHES / (SLIDE_CANVAS_WIDTH_PX / 96.0)
-CSS_PX_TO_PT = 0.75 * _LAYOUT_SCALE
 
 # 1 CSS px ≈ 0.5pt on this canvas, so small UI text (e.g. 14px tags → 7pt) must
 # be allowed below the old 8pt floor or it renders larger than the source and
@@ -99,443 +116,48 @@ MAX_FONT_SIZE_PT = 72
 MAX_HTML_SIZE_MB = 10
 
 PLAYWRIGHT_TIMEOUT_MS = 30_000
-FONT_LOAD_WAIT_MS = 1_000
+# JS-driven rendering (chart libraries animating on load) has no completion
+# signal; CSS animations are settled explicitly by EXTRACTION_JS instead.
+SCRIPT_SETTLE_MS = 1_000
+# Room between a chip's text and its padded box for borders and subpixel rounding;
+# a box with more empty space than this is a row or column, not a chip.
+CHIP_SLACK_PX = 12
+# Captured pictures (charts, icons, photos) are taken at 2x for crisp output.
+RASTER_DEVICE_SCALE_FACTOR = 2
 
-
-# ---------------------------------------------------------------------------
-# DOM measurement script (injected into the page via Playwright)
-#
-# Shows each slide in isolation (hiding siblings), clears ancestor CSS
-# transforms so getBoundingClientRect returns layout-space coordinates,
-# then recursively measures every visible element.
-#
-# Pure containers (no text, no image, no visible background, single child)
-# are collapsed to reduce nesting without losing visual information.
-# ---------------------------------------------------------------------------
-
-EXTRACTION_JS = """
-() => {
-    const slides = document.querySelectorAll('.slide');
-    const results = [];
-    let _svgCounter = 0;
-    const INLINE_TAGS = new Set([
-        'span','strong','em','b','i','a','code','mark','sub','sup',
-        'small','u','s','del','abbr','cite','q','time','var','kbd',
-    ]);
-
-    function getDirectText(el) {
-        let text = '';
-        for (const node of el.childNodes) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                const t = node.textContent.trim();
-                if (t) text += (text ? ' ' : '') + t;
-            }
-        }
-        return text;
-    }
-
-    function collectInlineRuns(el) {
-        const runs = [];
-        const parentStyle = getComputedStyle(el);
-        const pre = parentStyle.whiteSpace && parentStyle.whiteSpace.indexOf('pre') === 0;
-        const nodes = el.childNodes;
-        for (let ni = 0; ni < nodes.length; ni++) {
-            const node = nodes[ni];
-            if (node.nodeType === Node.TEXT_NODE) {
-                // In white-space:pre*, newlines and runs of spaces are significant
-                // (e.g. a terminal/code block). Preserve them: emit '\\n' runs at
-                // line breaks and keep the raw text (including indentation).
-                if (pre) {
-                    const segs = node.textContent.split('\\n');
-                    for (let si = 0; si < segs.length; si++) {
-                        if (si > 0) runs.push({ text: '\\n', color: parentStyle.color, fontSize: parseFloat(parentStyle.fontSize), fontFamily: parentStyle.fontFamily, fontWeight: parentStyle.fontWeight, fontStyle: parentStyle.fontStyle, textTransform: 'none' });
-                        if (segs[si].length) runs.push({ text: segs[si], color: parentStyle.color, fontSize: parseFloat(parentStyle.fontSize), fontFamily: parentStyle.fontFamily, fontWeight: parentStyle.fontWeight, fontStyle: parentStyle.fontStyle, textTransform: parentStyle.textTransform });
-                    }
-                    continue;
-                }
-                // Collapse internal whitespace runs to single spaces (browser behavior)
-                // but preserve boundary spaces between inline siblings
-                let t = node.textContent.replace(/\\s+/g, ' ');
-                if (ni === 0) t = t.replace(/^\\s+/, '');
-                if (ni === nodes.length - 1) t = t.replace(/\\s+$/, '');
-                if (!t) continue;
-                runs.push({
-                    text: t,
-                    color: parentStyle.color,
-                    fontSize: parseFloat(parentStyle.fontSize),
-                    fontFamily: parentStyle.fontFamily,
-                    fontWeight: parentStyle.fontWeight,
-                    fontStyle: parentStyle.fontStyle,
-                    textTransform: parentStyle.textTransform,
-                });
-            } else if (node.nodeType === Node.ELEMENT_NODE) {
-                const tag = node.tagName.toLowerCase();
-                if (['script','style','link','meta'].includes(tag)) continue;
-                const cs = getComputedStyle(node);
-                if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-                if (tag === 'br') {
-                    runs.push({ text: '\\n', color: parentStyle.color, fontSize: parseFloat(parentStyle.fontSize), fontFamily: parentStyle.fontFamily, fontWeight: parentStyle.fontWeight, fontStyle: parentStyle.fontStyle, textTransform: 'none' });
-                    continue;
-                }
-                const isInline = cs.display.startsWith('inline') || INLINE_TAGS.has(tag);
-                if (isInline) {
-                    const text = node.textContent.trim();
-                    if (text) {
-                        const childBgImage = cs.backgroundImage !== 'none' ? cs.backgroundImage : null;
-                        const childFillColor = cs.webkitTextFillColor || '';
-                        const childIsGradientText = (childFillColor === 'transparent' || childFillColor === 'rgba(0, 0, 0, 0)') && childBgImage && childBgImage.includes('gradient');
-                        runs.push({
-                            text: text,
-                            color: cs.color,
-                            fontSize: parseFloat(cs.fontSize),
-                            fontFamily: cs.fontFamily,
-                            fontWeight: cs.fontWeight,
-                            fontStyle: cs.fontStyle,
-                            textTransform: cs.textTransform,
-                            href: tag === 'a' ? node.getAttribute('href') : null,
-                            isGradientText: childIsGradientText,
-                            backgroundImage: childIsGradientText ? childBgImage : null,
-                        });
-                    }
-                }
-            }
-        }
-        return runs;
-    }
-
-    function hasChildElementText(el) {
-        for (const child of el.children) {
-            if (child.textContent && child.textContent.trim()) return true;
-        }
-        return false;
-    }
-
-    function clearAncestorTransforms(el) {
-        const saved = [];
-        let current = el;
-        while (current && current !== document.documentElement) {
-            const computed = getComputedStyle(current);
-            if (computed.transform && computed.transform !== 'none') {
-                saved.push({el: current, original: current.style.transform});
-                current.style.transform = 'none';
-            }
-            current = current.parentElement;
-        }
-        return saved;
-    }
-
-    function restoreTransforms(saved) {
-        for (const item of saved) {
-            item.el.style.transform = item.original;
-        }
-    }
-
-    function measureElement(el, slideRect, depth) {
-        if (depth > 15) return null;
-
-        const style = getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return null;
-        if (parseFloat(style.opacity) === 0) return null;
-
-        // A CSS rotate makes getBoundingClientRect return the (larger) enclosing
-        // box. Detect the angle, then measure the element with its own transform
-        // neutralized so we get the true unrotated box; PPTX re-applies the angle
-        // about the shape center. (Restored immediately to avoid side effects.)
-        let ownRotation = 0;
-        const _tf = style.transform;
-        if (_tf && _tf.indexOf('matrix') === 0) {
-            const mm = _tf.match(/matrix\\(([^)]+)\\)/);
-            if (mm) {
-                const p = mm[1].split(',').map(parseFloat);
-                const ang = Math.atan2(p[1], p[0]) * 180 / Math.PI;
-                if (Math.abs(ang) > 0.5) ownRotation = ang;
-            }
-        }
-        let _savedT = null;
-        if (ownRotation) { _savedT = el.style.transform; el.style.transform = 'none'; el.getBoundingClientRect(); }
-
-        const rect = el.getBoundingClientRect();
-        if (ownRotation) { el.style.transform = _savedT; }
-        const relX = rect.left - slideRect.left;
-        const relY = rect.top - slideRect.top;
-
-        if (rect.width < 1 || rect.height < 1) return null;
-        if (relX + rect.width <= 0 || relY + rect.height <= 0) return null;
-        if (relX >= slideRect.width || relY >= slideRect.height) return null;
-
-        let directText = getDirectText(el);
-        const tag = el.tagName.toLowerCase();
-
-        let markerColor = null;
-        let markerPrefix = '';
-        if (tag === 'li') {
-            const parentTag = el.parentElement ? el.parentElement.tagName.toLowerCase() : '';
-            const listStyle = getComputedStyle(el).listStyleType;
-            if (parentTag === 'ol') {
-                const index = Array.from(el.parentElement.children).indexOf(el) + 1;
-                markerPrefix = index + '. ';
-                directText = markerPrefix + directText;
-            } else if (listStyle !== 'none') {
-                markerPrefix = '\\u2022 ';
-                directText = markerPrefix + directText;
-            }
-            try {
-                const ms = getComputedStyle(el, '::marker');
-                if (ms && ms.color) markerColor = ms.color;
-            } catch(e) {}
-        }
-
-        const isImg = tag === 'img';
-        const isSvg = tag === 'svg';
-        const hasVisibleBg = style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
-                             style.backgroundColor !== 'transparent';
-        const hasBorder = style.borderWidth && style.borderWidth !== '0px' &&
-                         style.borderStyle !== 'none';
-
-        const bgImage = style.backgroundImage !== 'none' ? style.backgroundImage : null;
-        const textFillColor = style.webkitTextFillColor || style.WebkitTextFillColor || '';
-        const isFillTransparent = textFillColor === 'transparent' || textFillColor === 'rgba(0, 0, 0, 0)';
-        const isGradientText = isFillTransparent && bgImage && bgImage.includes('gradient');
-
-        const data = {
-            tag: tag,
-            x: relX,
-            y: relY,
-            width: rect.width,
-            height: rect.height,
-            text: directText,
-            color: style.color,
-            backgroundColor: hasVisibleBg ? style.backgroundColor : null,
-            fontSize: parseFloat(style.fontSize),
-            fontFamily: style.fontFamily,
-            fontWeight: style.fontWeight,
-            fontStyle: style.fontStyle,
-            textAlign: style.textAlign,
-            lineHeight: style.lineHeight,
-            letterSpacing: (style.letterSpacing === 'normal' ? 0 : (parseFloat(style.letterSpacing) || 0)),
-            direction: style.direction,
-            position: style.position,
-            display: style.display,
-            justifyContent: style.justifyContent,
-            alignItems: style.alignItems,
-            writingMode: style.writingMode,
-            rotation: ownRotation,
-            opacity: parseFloat(style.opacity),
-            paddingLeft: parseFloat(style.paddingLeft) || 0,
-            paddingRight: parseFloat(style.paddingRight) || 0,
-            paddingTop: parseFloat(style.paddingTop) || 0,
-            paddingBottom: parseFloat(style.paddingBottom) || 0,
-            objectFit: isImg ? style.objectFit : null,
-            naturalWidth: isImg ? (el.naturalWidth || 0) : 0,
-            naturalHeight: isImg ? (el.naturalHeight || 0) : 0,
-            borderRadius: style.borderRadius,
-            borderColor: hasBorder ? style.borderColor : null,
-            borderWidth: hasBorder ? parseFloat(style.borderWidth) : 0,
-            borderStyle: hasBorder ? style.borderStyle : null,
-            borderLeftColor: style.borderLeftColor !== style.borderColor ? style.borderLeftColor : null,
-            borderLeftWidth: parseFloat(style.borderLeftWidth) || 0,
-            borderLeftStyle: style.borderLeftColor !== style.borderColor ? style.borderLeftStyle : null,
-            textTransform: style.textTransform,
-            backgroundImage: bgImage,
-            isGradientText: isGradientText,
-            isImage: isImg,
-            isSvg: isSvg,
-            src: isImg ? el.getAttribute('src') : null,
-            href: tag === 'a' ? el.getAttribute('href') : null,
-            markerColor: markerColor,
-            children: []
-        };
-
-        // Mark inline SVGs for rasterization in the Python post-pass
-        if (isSvg) {
-            const svgId = 'pptx-svg-' + (_svgCounter++);
-            el.setAttribute('data-pptx-id', svgId);
-            data.svgId = svgId;
-        }
-
-        for (const child of el.children) {
-            if (['script', 'style', 'link', 'meta'].includes(child.tagName.toLowerCase())) continue;
-            const childData = measureElement(child, slideRect, depth + 1);
-            if (childData) data.children.push(childData);
-        }
-
-        // Measure ::before and ::after pseudo-elements as synthetic children
-        for (const pseudo of ['::before', '::after']) {
-            try {
-                const ps = getComputedStyle(el, pseudo);
-                if (!ps.content || ps.content === 'none' || ps.content === 'normal') continue;
-                if (ps.display === 'none') continue;
-
-                const psBg = ps.backgroundColor !== 'rgba(0, 0, 0, 0)' && ps.backgroundColor !== 'transparent';
-                const pw = parseFloat(ps.width) || 0;
-                const ph = parseFloat(ps.height) || 0;
-                if (pw < 1 && ph < 1 && !psBg) continue;
-
-                let px = relX, py = relY;
-                const pt = parseFloat(ps.top); const pl = parseFloat(ps.left);
-                const pr = parseFloat(ps.right); const pb = parseFloat(ps.bottom);
-                if (ps.position === 'absolute') {
-                    if (!isNaN(pl)) px = relX + pl;
-                    else if (!isNaN(pr)) px = relX + rect.width - pw - pr;
-                    if (!isNaN(pt)) py = relY + pt;
-                    else if (!isNaN(pb)) py = relY + rect.height - ph - pb;
-                }
-
-                if (pw > 0 && ph > 0) {
-                    data.children.push({
-                        tag: '_pseudo',
-                        x: px, y: py, width: pw, height: ph,
-                        text: '',
-                        color: ps.color,
-                        backgroundColor: psBg ? ps.backgroundColor : null,
-                        backgroundImage: ps.backgroundImage !== 'none' ? ps.backgroundImage : null,
-                        fontSize: 0, fontFamily: '', fontWeight: '400', fontStyle: 'normal',
-                        textAlign: 'left', lineHeight: 'normal', direction: 'ltr',
-                        opacity: parseFloat(ps.opacity), borderRadius: ps.borderRadius,
-                        borderColor: null, borderWidth: 0, borderStyle: null,
-                        borderLeftColor: null, borderLeftWidth: 0, borderLeftStyle: null,
-                        textTransform: 'none', isImage: false, src: null, href: null,
-                        markerColor: null, children: [], isGradientText: false,
-                    });
-                }
-            } catch(e) {}
-        }
-
-        if (directText && hasChildElementText(el)) {
-            const runs = collectInlineRuns(el);
-            if (runs.length > 0) {
-                if (markerPrefix && runs.length > 0) {
-                    runs[0].text = markerPrefix + runs[0].text;
-                }
-                data.inlineRuns = runs;
-                data.text = '';
-            }
-        }
-
-        const isContainer = !data.text && !isImg && !isSvg && !hasVisibleBg && !hasBorder &&
-                           data.backgroundImage === null && !data.inlineRuns;
-        if (isContainer && data.children.length === 1 && depth > 0) {
-            const child = data.children[0];
-            // A pure wrapper is collapsed away, but its visual effects must be
-            // folded into the surviving child, or they are silently lost:
-            //  - opacity (e.g. a faint hero-image wrapper at opacity:0.18)
-            //  - border-radius + overflow:hidden clipping (rounded image frames)
-            if (data.opacity < 1) {
-                child.opacity = (child.opacity == null ? 1 : child.opacity) * data.opacity;
-            }
-            const childHasRadius = child.borderRadius && child.borderRadius !== '0px'
-                && child.borderRadius !== '0';
-            if (!childHasRadius && data.borderRadius && data.borderRadius !== '0px'
-                && data.borderRadius !== '0') {
-                child.borderRadius = data.borderRadius;
-            }
-            return child;
-        }
-
-        return data;
-    }
-
-    slides.forEach((slide, slideIndex) => {
-        slides.forEach((s, i) => {
-            if (i === slideIndex) {
-                s.style.display = 'flex';
-                s.classList.add('active');
-            } else {
-                s.style.display = 'none';
-                s.classList.remove('active');
-            }
-        });
-
-        const savedTransforms = clearAncestorTransforms(slide);
-        slide.offsetHeight;
-
-        const slideRect = slide.getBoundingClientRect();
-        const slideStyle = getComputedStyle(slide);
-        const slideData = {
-            index: slideIndex,
-            width: slideRect.width,
-            height: slideRect.height,
-            backgroundColor: slideStyle.backgroundColor,
-            backgroundImage: slideStyle.backgroundImage !== 'none' ? slideStyle.backgroundImage : null,
-            elements: []
-        };
-
-        for (const child of slide.children) {
-            if (['script', 'style', 'link', 'meta'].includes(child.tagName.toLowerCase())) continue;
-            const measured = measureElement(child, slideRect, 0);
-            if (measured) slideData.elements.push(measured);
-        }
-
-        restoreTransforms(savedTransforms);
-        results.push(slideData);
-    });
-
-    return results;
+# Formats python-pptx can embed; anything else is transcoded to PNG first.
+_PPTX_IMAGE_FORMATS = {"BMP", "GIF", "JPEG", "PNG", "TIFF", "WMF"}
+_DATA_URI_RE = re.compile(r"data:image/[\w.+-]+;base64,(.*)", re.DOTALL)
+_DASHED_BORDER_STYLES = {
+    "dashed": MSO_LINE_DASH_STYLE.DASH,
+    "dotted": MSO_LINE_DASH_STYLE.ROUND_DOT,
 }
-"""
-
 
 # ---------------------------------------------------------------------------
 # Color and font parsing
 # ---------------------------------------------------------------------------
 
-_RGB_RE = re.compile(
-    r"rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)"
-)
-
-
-def _css_color_to_rgb(css_color: str) -> tuple[RGBColor, float] | None:
-    """Parse a CSS color string to (RGBColor, opacity). Returns None for transparent."""
-    if not css_color or css_color == "transparent":
-        return None
-    match = _RGB_RE.match(css_color)
-    if match:
-        r, g, b = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        a = float(match.group(4)) if match.group(4) else 1.0
-        if a < 0.01:
-            return None
-        return RGBColor(r, g, b), a
-    if css_color.startswith("#"):
-        h = css_color.lstrip("#")
-        if len(h) == 3:
-            h = "".join(c * 2 for c in h)
-        return RGBColor(int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)), 1.0
-    return None
-
-
 # Default backdrop used when a slide has no resolvable background color.
 _DEFAULT_BACKDROP = RGBColor(0xFF, 0xFF, 0xFF)
 
 
-def _blend_over(color: RGBColor, alpha: float, backdrop: RGBColor) -> RGBColor:
-    """Alpha-composite ``color`` at ``alpha`` over an opaque ``backdrop``.
-
-    LibreOffice (and PowerPoint's PDF export) do not honor per-gradient-stop
-    ``<a:alpha>`` and are unreliable with solid-fill / run-color alpha, so
-    translucency is flattened to an equivalent opaque color at conversion time.
-    This makes the PPTX render identically to the source HTML everywhere.
-    """
-    alpha = max(0.0, min(1.0, alpha))
-    r = round(color[0] * alpha + backdrop[0] * (1 - alpha))
-    g = round(color[1] * alpha + backdrop[1] * (1 - alpha))
-    b = round(color[2] * alpha + backdrop[2] * (1 - alpha))
-    return RGBColor(int(r), int(g), int(b))
-
-
 def _resolve_backdrop(slide_data: dict) -> RGBColor:
     """Best-effort opaque backdrop color for a slide (for flattening alpha)."""
+    if slide_data.get("paintBackdrop"):
+        return RGBColor(*slide_data["paintBackdrop"])
     grad = slide_data.get("backgroundImage", "")
     if grad:
         first = _first_gradient_color(grad)
         if first is not None:
             return first
-    bg = _css_color_to_rgb(slide_data.get("backgroundColor", ""))
+    bg = css_color_to_rgb(slide_data.get("backgroundColor", ""))
     if bg is not None:
         return bg[0]
     return _DEFAULT_BACKDROP
 
 
-_GRADIENT_ANGLE_RE = re.compile(r"linear-gradient\(\s*([\d.]+)deg")
+_GRADIENT_ANGLE_RE = re.compile(r"linear-gradient\(\s*(-?[\d.]+)(deg|turn|rad|grad)\b")
+_ANGLE_UNIT_TO_DEG = {"deg": 1.0, "turn": 360.0, "rad": 180.0 / 3.141592653589793, "grad": 0.9}
 _GRADIENT_DIR_RE = re.compile(r"linear-gradient\(\s*to\s+([\w\s]+?)\s*,")
 
 _CSS_DIR_TO_DEG = {
@@ -547,34 +169,67 @@ _CSS_DIR_TO_DEG = {
 }
 
 
-def _parse_css_gradient(
-    css_val: str,
-) -> list[tuple[RGBColor, float, float]] | None:
-    """Parse CSS linear-gradient into [(RGBColor, position, alpha), ...].
+def _resolve_stop_positions(
+    stops: list[tuple[RGBColor, float | None, float]],
+) -> list[tuple[RGBColor, float, float]]:
+    """Fill in omitted stop positions the way CSS does.
 
-    Handles both opaque and transparent stops. Returns None if not a gradient.
+    Missing first/last positions are 0%/100%, a position below an earlier one is
+    raised to it, and runs of missing positions are spread evenly between their
+    neighbours. Results are clamped to OOXML's 0–100% range.
     """
-    if not css_val or "linear-gradient" not in css_val:
+    positions = [pos for _, pos, _ in stops]
+    positions[0] = 0.0 if positions[0] is None else positions[0]
+    positions[-1] = 1.0 if positions[-1] is None else positions[-1]
+    running_max = positions[0]
+    for i, pos in enumerate(positions):
+        if pos is not None:
+            running_max = max(running_max, pos)
+            positions[i] = running_max
+    i = 1
+    while i < len(positions):
+        if positions[i] is None:
+            j = next(k for k in range(i, len(positions)) if positions[k] is not None)
+            step = (positions[j] - positions[i - 1]) / (j - i + 1)
+            for k in range(i, j):
+                positions[k] = positions[i - 1] + step * (k - i + 1)
+            i = j
+        i += 1
+    return [
+        (color, min(1.0, max(0.0, pos)), alpha)
+        for (color, _, alpha), pos in zip(stops, positions)
+    ]
+
+
+def _parse_css_gradient(
+    css_val: str | None,
+) -> list[tuple[RGBColor, float, float]] | None:
+    """Parse a single CSS linear-gradient into [(RGBColor, position, alpha), ...].
+
+    Honors percentage stop positions (including hard stops and the two-position
+    ``red 20% 40%`` form); other units are interpolated like omitted positions.
+    Returns None for anything else — radial/conic/repeating gradients and
+    layered backgrounds are captured as pictures by the raster pass instead.
+    """
+    if not css_val or not css_val.startswith("linear-gradient("):
         return None
-    # Only a single linear-gradient is representable. A radial/conic gradient, or
-    # a multi-layered background (comma-separated gradients, e.g. a radial glow
-    # over a base gradient), would otherwise have all its rgba stops scraped into
-    # one bogus linear gradient — fall back to the solid background color instead.
-    if "radial-gradient" in css_val or "conic-gradient" in css_val:
+    if len(split_top_level(css_val)) > 1:
         return None
-    if css_val.count("linear-gradient") > 1:
-        return None
-    stops: list[tuple[RGBColor, float, float]] = []
-    for m in _RGB_RE.finditer(css_val):
-        r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        a = float(m.group(4)) if m.group(4) else 1.0
-        stops.append((RGBColor(r, g, b), 0.0, a))
+    stops: list[tuple[RGBColor, float | None, float]] = []
+    for arg in split_top_level(css_val[len("linear-gradient("):-1]):
+        match = RGB_RE.match(arg)
+        if not match:
+            continue  # direction/angle, or a color hint
+        color, alpha = rgb_match_to_color(match)
+        positions = [
+            float(token[:-1]) / 100 if token.endswith("%") else None
+            for token in arg[match.end():].split()
+        ]
+        for pos in positions or [None]:
+            stops.append((color, pos, alpha))
     if len(stops) < 2:
         return None
-    # Distribute positions evenly
-    for i, (color, _, alpha) in enumerate(stops):
-        stops[i] = (color, i / (len(stops) - 1), alpha)
-    return stops
+    return _resolve_stop_positions(stops)
 
 
 def _gradient_angle_emu(css_val: str) -> int:
@@ -586,7 +241,7 @@ def _gradient_angle_emu(css_val: str) -> int:
     """
     m = _GRADIENT_ANGLE_RE.search(css_val or "")
     if m:
-        css_deg = float(m.group(1))
+        css_deg = float(m.group(1)) * _ANGLE_UNIT_TO_DEG[m.group(2)]
     else:
         dm = _GRADIENT_DIR_RE.search(css_val or "")
         css_deg = _CSS_DIR_TO_DEG.get(dm.group(1).strip(), 180) if dm else 180.0
@@ -612,7 +267,7 @@ def _apply_gradient_fill(xml_ancestor, css_val: str, backdrop: RGBColor | None =
     angle = _gradient_angle_emu(css_val)
     if backdrop is not None:
         stops = [
-            (_blend_over(color, alpha, backdrop), pos, 1.0) if alpha < 0.99
+            (blend_over(color, alpha, backdrop), pos, 1.0) if alpha < 0.99
             else (color, pos, alpha)
             for color, pos, alpha in stops
         ]
@@ -723,12 +378,12 @@ def _resolve_font_color(el: dict, backdrop: RGBColor | None = None) -> RGBColor:
         if grad_color:
             return grad_color
 
-    result = _css_color_to_rgb(el.get("color", "rgb(255,255,255)"))
+    result = css_color_to_rgb(el.get("color", "rgb(255,255,255)"))
     if not result:
         return RGBColor(0xFF, 0xFF, 0xFF)
     color, alpha = result
     if alpha < 0.99 and backdrop is not None:
-        return _blend_over(color, alpha, backdrop)
+        return blend_over(color, alpha, backdrop)
     return color
 
 
@@ -925,41 +580,47 @@ def _add_image_from_data_uri(slide, data_uri: str, left, top, width, height,
     When opacity < 1, the picture is made translucent to match the source.
     When object_fit == 'cover', the picture is cropped (not stretched) to fill.
     """
-    match = re.match(r"data:image/(\w+);base64,(.*)", data_uri, re.DOTALL)
+    img_bytes = _embeddable_image_bytes(data_uri)
+    if img_bytes is None:
+        return None
+    pic = slide.shapes.add_picture(io.BytesIO(img_bytes), left, top, width, height)
+
+    if object_fit == "cover":
+        _apply_object_fit_cover(pic, width_px, height_px, natural_w, natural_h)
+
+    if border_radius_px > 0 and width_px > 0 and height_px > 0:
+        sp_pr = pic._element.find(qn("p:spPr"))
+        if sp_pr is not None:
+            prst_geom = sp_pr.find(qn("a:prstGeom"))
+            if prst_geom is not None:
+                prst_geom.set("prst", "roundRect")
+                _set_corner_radius(pic, border_radius_px, width_px, height_px)
+
+    _apply_image_opacity(pic, opacity)
+    return pic
+
+
+def _embeddable_image_bytes(data_uri: str) -> bytes | None:
+    """Decode a data URI into bytes python-pptx can embed, or None if impossible.
+
+    WebP/AVIF/ICO and friends are transcoded to PNG (python-pptx rejects them).
+    SVG is not decodable here; the raster pass normally replaces it upstream.
+    """
+    match = _DATA_URI_RE.match(data_uri)
     if not match:
+        logger.warning("Skipping image with a non-base64 data URI")
         return None
-    ext = match.group(1)
+    img_bytes = base64.b64decode(match.group(1))
     try:
-        img_bytes = base64.b64decode(match.group(2))
-    except Exception:
-        logger.warning("Failed to decode base64 image data")
+        image = Image.open(io.BytesIO(img_bytes))
+    except UnidentifiedImageError:
+        logger.warning("Skipping image in a format Pillow cannot decode: %s", data_uri[:40])
         return None
-
-    tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
-    try:
-        tmp.write(img_bytes)
-        tmp.close()
-        pic = slide.shapes.add_picture(tmp.name, left, top, width, height)
-
-        if object_fit == "cover":
-            _apply_object_fit_cover(pic, width_px, height_px, natural_w, natural_h)
-
-        if border_radius_px > 0 and width_px > 0 and height_px > 0:
-            sp_pr = pic._element.find(qn("p:spPr"))
-            if sp_pr is not None:
-                prst_geom = sp_pr.find(qn("a:prstGeom"))
-                if prst_geom is not None:
-                    prst_geom.set("prst", "roundRect")
-                    _set_corner_radius(pic, border_radius_px, width_px, height_px)
-
-        _apply_image_opacity(pic, opacity)
-
-        return pic
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+    if image.format in _PPTX_IMAGE_FORMATS:
+        return img_bytes
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -975,14 +636,6 @@ def _any_descendant_has_text(el: dict) -> bool:
         if _any_descendant_has_text(child):
             return True
     return False
-
-
-def _count_elements(elements: list[dict]) -> int:
-    """Count total elements in a measurement tree (including nested children)."""
-    total = len(elements)
-    for el in elements:
-        total += _count_elements(el.get("children", []))
-    return total
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +706,11 @@ def _set_corner_radius(
     gd.set("fmla", f"val {adj_val}")
 
 
+def _box_hugs_text(el: dict) -> bool:
+    content_px = el.get("width", 0) - el.get("paddingLeft", 0) - el.get("paddingRight", 0)
+    return content_px - el.get("textWidth", 0) <= CHIP_SLACK_PX
+
+
 def _resolve_alignment(
     el: dict, is_single_line: bool, has_visual_bg: bool,
 ):
@@ -1097,10 +755,12 @@ def _resolve_alignment(
         has_visual_bg and is_single_line and text_align in ("start", "left", "")
         and el.get("tag") not in ("td", "th")
         and "table" not in display
+        and _box_hugs_text(el)
     ):
         # A background chip whose box hugs its text (symmetric padding) reads
-        # centered in the source even though text-align defaults to left. Table
-        # cells also have a background but must keep their column alignment.
+        # centered in the source even though text-align defaults to left;
+        # centering absorbs substitute-font width differences. Table cells and
+        # full-width rows also have a background but keep their text at the start.
         h = PP_ALIGN.CENTER
 
     if v == MSO_ANCHOR.TOP and is_single_line:
@@ -1229,7 +889,7 @@ def _estimate_text_width_in(
     """Estimate rendered width (inches) of a single line at ``size_pt``."""
     if not text:
         return 0.0
-    extra_pt = max(0, len(text) - 1) * letter_spacing_px  # px≈pt for width math
+    extra_pt = max(0, len(text) - 1) * letter_spacing_px * CSS_PX_TO_PT
     if _HAVE_PIL:
         path = _find_measure_font(family, bold)
         if path:
@@ -1325,104 +985,6 @@ def _apply_vertical_text(tf, el: dict) -> None:
         pass
 
 
-def _conic_angle(tok: str) -> float | None:
-    tok = tok.strip()
-    try:
-        if tok.endswith("%"):
-            return float(tok[:-1]) * 3.6
-        if tok.endswith("deg"):
-            return float(tok[:-3])
-        if tok.endswith("turn"):
-            return float(tok[:-4]) * 360.0
-        return float(tok)
-    except ValueError:
-        return None
-
-
-def _parse_conic_gradient(css: str):
-    """Parse a conic-gradient into [(RGBColor, start_deg, end_deg), ...]."""
-    if not css or "conic-gradient" not in css:
-        return None
-    i = css.find("conic-gradient(") + len("conic-gradient(")
-    depth, end = 1, len(css)
-    for j in range(i, len(css)):
-        if css[j] == "(":
-            depth += 1
-        elif css[j] == ")":
-            depth -= 1
-            if depth == 0:
-                end = j
-                break
-    body = css[i:end]
-    parts, buf, d = [], "", 0
-    for ch in body:
-        if ch == "(":
-            d += 1
-        elif ch == ")":
-            d -= 1
-        if ch == "," and d == 0:
-            parts.append(buf); buf = ""
-        else:
-            buf += ch
-    if buf.strip():
-        parts.append(buf)
-
-    segs: list[list] = []
-    cursor = 0.0
-    for part in parts:
-        m = re.match(r"\s*(rgba?\([^)]*\)|#[0-9a-fA-F]{3,6})", part)
-        if not m:
-            continue
-        cres = _css_color_to_rgb(m.group(1))
-        if not cres:
-            continue
-        nums = [t for t in part[m.end():].split() if t]
-        start = _conic_angle(nums[0]) if len(nums) >= 1 else cursor
-        end_a = _conic_angle(nums[1]) if len(nums) >= 2 else None
-        if start is None:
-            start = cursor
-        segs.append([cres[0], start, end_a])
-        cursor = end_a if end_a is not None else start
-    for k in range(len(segs)):
-        if segs[k][2] is None or segs[k][2] <= segs[k][1]:
-            segs[k][2] = segs[k + 1][1] if k + 1 < len(segs) else 360.0
-    return segs or None
-
-
-def _render_conic_gradient(slide, el: dict, x_in, y_in, w_in, h_in) -> bool:
-    """Rasterize a conic-gradient (pie/donut ring) to a picture — OOXML has none."""
-    if not _HAVE_PIL:
-        return False
-    segs = _parse_conic_gradient(el.get("backgroundImage", ""))
-    if not segs:
-        return False
-    try:
-        from io import BytesIO
-
-        from PIL import Image, ImageDraw
-    except Exception:
-        return False
-    S = 700
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    for color, a0, a1 in segs:
-        # PIL angles start at 3 o'clock; CSS conic starts at 12 o'clock → -90.
-        d.pieslice([0, 0, S - 1, S - 1], a0 - 90, a1 - 90,
-                   fill=(int(color[0]), int(color[1]), int(color[2]), 255))
-    radius_px = _parse_border_radius_px(el)
-    if radius_px > 0 and radius_px >= 0.5 * min(el.get("width", 0), el.get("height", 0)):
-        mask = Image.new("L", (S, S), 0)
-        ImageDraw.Draw(mask).ellipse([0, 0, S - 1, S - 1], fill=255)
-        img.putalpha(mask)
-    buf = BytesIO()
-    img.save(buf, "PNG")
-    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    _add_image_from_data_uri(
-        slide, uri, Inches(x_in), Inches(y_in), Inches(w_in), Inches(h_in),
-    )
-    return True
-
-
 def _find_top_accent(el: dict, radius_px: float) -> dict | None:
     """A thin, full-width, text-free colored child flush with the card's top edge
     (e.g. a ::before accent strip) — rendered specially so it inherits the card's
@@ -1437,7 +999,7 @@ def _find_top_accent(el: dict, radius_px: float) -> dict | None:
         if ch.get("text", "").strip() or _any_descendant_has_text(ch):
             continue
         has_fill = (
-            _css_color_to_rgb(ch.get("backgroundColor", "")) is not None
+            css_color_to_rgb(ch.get("backgroundColor", "")) is not None
             or bool(_parse_css_gradient(ch.get("backgroundImage", "")))
         )
         if not has_fill:
@@ -1457,15 +1019,21 @@ def _fill_accent(shape, el: dict, backdrop: RGBColor | None) -> None:
     if _parse_css_gradient(el.get("backgroundImage", "")):
         _apply_gradient_fill(shape._element, el["backgroundImage"], backdrop)
         return
-    res = _css_color_to_rgb(el.get("backgroundColor", ""))
+    res = css_color_to_rgb(el.get("backgroundColor", ""))
     if res:
         col, a = res
         shape.fill.solid()
         shape.fill.fore_color.rgb = (
-            _blend_over(col, a, backdrop) if a < 0.99 and backdrop is not None else col
+            blend_over(col, a, backdrop) if a < 0.99 and backdrop is not None else col
         )
     else:
         shape.fill.background()
+
+
+def _apply_border_dash(shape, el: dict) -> None:
+    dash = _DASHED_BORDER_STYLES.get(el.get("borderStyle"))
+    if dash is not None:
+        shape.line.dash_style = dash
 
 
 def _render_bg_shape(
@@ -1479,7 +1047,7 @@ def _render_bg_shape(
     backdrop: RGBColor | None = None,
 ) -> None:
     """Render a background/border rectangle (optionally rounded)."""
-    bg_result = _css_color_to_rgb(el.get("backgroundColor", ""))
+    bg_result = css_color_to_rgb(el.get("backgroundColor", ""))
     has_fill = bg_result is not None
     has_gradient = bool(_parse_css_gradient(el.get("backgroundImage", "")))
 
@@ -1495,10 +1063,13 @@ def _render_bg_shape(
     left_border_color = el.get("borderLeftColor")
     left_border_width = el.get("borderLeftWidth", 0)
     left_border_style = el.get("borderLeftStyle")
-    left_result = _css_color_to_rgb(left_border_color) if left_border_color else None
+    left_result = css_color_to_rgb(left_border_color) if left_border_color else None
+    # Only a left border thicker than the other sides reads as an accent; a
+    # plain hairline is drawn at its true width by render_side_borders.
+    other_side_widths = [s["width"] for s in el.get("borderSides", []) if s["side"] != "left"]
     has_left_accent = bool(
         left_result
-        and left_border_width > 0
+        and left_border_width > max(other_side_widths, default=0)
         and left_border_style not in (None, "none")
     )
 
@@ -1510,10 +1081,13 @@ def _render_bg_shape(
 
     card_x, card_w = x_in, w_in
     card_y, card_h = y_in, h_in
+    # The full-size shape beneath an inset card carries the card's shadow.
+    full_size_shape = None
     if has_left_accent:
+        mark_left_border_drawn(el)
         accent_color = left_result[0]
         if left_result[1] < 0.99 and backdrop is not None:
-            accent_color = _blend_over(accent_color, left_result[1], backdrop)
+            accent_color = blend_over(accent_color, left_result[1], backdrop)
         bar_w = max(left_border_width * PIXELS_TO_INCHES_X, 0.03)
         if radius_px > 0:
             # Rounded accent: full-size rounded rect underneath, card inset right.
@@ -1526,6 +1100,7 @@ def _render_bg_shape(
             accent.fill.solid()
             accent.fill.fore_color.rgb = accent_color
             accent.line.fill.background()
+            full_size_shape = accent
             card_x = x_in + bar_w
             card_w = max(w_in - bar_w, 0.05)
 
@@ -1535,7 +1110,7 @@ def _render_bg_shape(
     # same-radius rounded rect the full card size UNDER the card, with the card
     # pushed down by the bar height so only the rounded top sliver shows.
     if radius_px > 0:
-        top_accent = _find_top_accent(el, radius_px)
+        top_accent = claim_top_border(el) or _find_top_accent(el, radius_px)
         if top_accent is not None:
             bar_h = max(top_accent.get("height", 0) * PIXELS_TO_INCHES_Y, 0.03)
             acc = slide.shapes.add_shape(
@@ -1544,6 +1119,7 @@ def _render_bg_shape(
             _set_corner_radius(acc, radius_px, el.get("width", 100), el.get("height", 100))
             _fill_accent(acc, top_accent, backdrop)
             acc.line.fill.background()
+            full_size_shape = full_size_shape or acc
             card_y = y_in + bar_h
             card_h = max(h_in - bar_h, 0.05)
             top_accent["_skip"] = True
@@ -1566,7 +1142,7 @@ def _render_bg_shape(
         effective_alpha = bg_alpha * opacity
         shape.fill.solid()
         if effective_alpha < 0.99 and backdrop is not None:
-            shape.fill.fore_color.rgb = _blend_over(bg_color, effective_alpha, backdrop)
+            shape.fill.fore_color.rgb = blend_over(bg_color, effective_alpha, backdrop)
         else:
             shape.fill.fore_color.rgb = bg_color
             if effective_alpha < 0.99:
@@ -1575,19 +1151,21 @@ def _render_bg_shape(
         shape.fill.background()
 
     if has_border:
-        border_result = _css_color_to_rgb(border_color_str)
+        border_result = css_color_to_rgb(border_color_str)
         if border_result and border_result[1] > 0.15:
             border_color = border_result[0]
             if border_result[1] < 0.99 and backdrop is not None:
-                border_color = _blend_over(border_color, border_result[1], backdrop)
+                border_color = blend_over(border_color, border_result[1], backdrop)
             shape.line.color.rgb = border_color
             shape.line.width = Pt(max(border_width * CSS_PX_TO_PT, 0.5))
+            _apply_border_dash(shape, el)
         else:
             shape.line.fill.background()
     else:
         shape.line.fill.background()
 
     _apply_rotation(shape, el)
+    apply_element_shadow(full_size_shape or shape, el)
 
     # Square left accent bar (non-rounded cards): a thin filled rectangle on top.
     if has_left_accent and radius_px <= 0:
@@ -1617,13 +1195,13 @@ def _apply_shape_bg(
         _apply_gradient_fill(shape_or_txbox._element, gradient_css, backdrop)
         return
 
-    bg_result = _css_color_to_rgb(el.get("backgroundColor", ""))
+    bg_result = css_color_to_rgb(el.get("backgroundColor", ""))
     if bg_result:
         bg_color, bg_alpha = bg_result
         effective_alpha = bg_alpha * opacity
         shape_or_txbox.fill.solid()
         if effective_alpha < 0.99 and backdrop is not None:
-            shape_or_txbox.fill.fore_color.rgb = _blend_over(
+            shape_or_txbox.fill.fore_color.rgb = blend_over(
                 bg_color, effective_alpha, backdrop,
             )
         else:
@@ -1709,15 +1287,17 @@ def _render_text_element(
         else:
             shape.fill.background()
         if has_border:
-            br = _css_color_to_rgb(el.get("borderColor", ""))
+            br = css_color_to_rgb(el.get("borderColor", ""))
             if br and br[1] > 0.15:
-                bc = _blend_over(br[0], br[1], backdrop) if br[1] < 0.99 and backdrop else br[0]
+                bc = blend_over(br[0], br[1], backdrop) if br[1] < 0.99 and backdrop else br[0]
                 shape.line.color.rgb = bc
                 shape.line.width = Pt(max(el.get("borderWidth", 1) * CSS_PX_TO_PT, 0.5))
+                _apply_border_dash(shape, el)
             else:
                 shape.line.fill.background()
         else:
             shape.line.fill.background()
+        apply_element_shadow(shape, el)
         box_holder = shape
         tf = shape.text_frame
     else:
@@ -1748,9 +1328,10 @@ def _render_text_element(
         len(text) >= 3 and text[0].isdigit() and text[:3].rstrip().endswith(".")
     )
 
+    letter_spacing_pt = el.get("letterSpacing", 0) * CSS_PX_TO_PT
     primary_run: object
     if marker_color_str and has_bullet:
-        marker_result = _css_color_to_rgb(marker_color_str)
+        marker_result = css_color_to_rgb(marker_color_str)
         if marker_result and text.startswith("\u2022 "):
             bullet_run = p.add_run()
             bullet_run.text = "\u2022 "
@@ -1762,6 +1343,7 @@ def _render_text_element(
                 italic=False,
                 family=font_family,
             )
+            apply_run_typography(bullet_run, letter_spacing_pt, None)
             primary_run = p.add_run()
             primary_run.text = text[2:]
         else:
@@ -1779,6 +1361,7 @@ def _render_text_element(
         italic=is_italic,
         family=font_family,
     )
+    apply_run_typography(primary_run, letter_spacing_pt, el.get("textDecoration"))
 
     # Real gradient text: LibreOffice and PowerPoint both render a run-level
     # <a:gradFill>, so reproduce the CSS gradient. _resolve_font_color already set
@@ -1878,7 +1461,9 @@ def _render_inline_runs(
             sz = max(MIN_FONT_SIZE_PT, min(rd.get("fontSize", el.get("fontSize", 20)) * CSS_PX_TO_PT, MAX_FONT_SIZE_PT))
             fam = _resolve_pptx_font(rd.get("fontFamily", el.get("fontFamily", "Calibri")))
             bold = rd.get("fontWeight", "400") in ("bold", "600", "700", "800", "900")
-            est = _estimate_text_width_in(t, sz, fam, bold, el.get("letterSpacing", 0))
+            est = _estimate_text_width_in(
+                t, sz, fam, bold, rd.get("letterSpacing", el.get("letterSpacing", 0)),
+            )
             total_in += est or 0.0
         if total_in > avail_in > 0.05:
             run_scale = (avail_in / total_in) * 0.98
@@ -1918,13 +1503,13 @@ def _render_inline_runs(
         run_is_gradient = run_data.get("isGradientText", False)
         run_bg_image = run_data.get("backgroundImage", "")
 
-        color_result = _css_color_to_rgb(run_data.get("color", el.get("color", "rgb(255,255,255)")))
+        color_result = css_color_to_rgb(run_data.get("color", el.get("color", "rgb(255,255,255)")))
         if run_is_gradient and run_bg_image:
             run_color = _first_gradient_color(run_bg_image) or RGBColor(0xFF, 0xFF, 0xFF)
         elif color_result:
             run_color, run_alpha = color_result
             if run_alpha < 0.99 and backdrop is not None:
-                run_color = _blend_over(run_color, run_alpha, backdrop)
+                run_color = blend_over(run_color, run_alpha, backdrop)
         else:
             run_color = _resolve_font_color(el, backdrop)
 
@@ -1935,6 +1520,11 @@ def _render_inline_runs(
         r = p.add_run()
         r.text = text
         _apply_font(r, size_pt=run_size, color=run_color, bold=run_bold, italic=run_italic, family=run_family)
+        apply_run_typography(
+            r,
+            run_data.get("letterSpacing", el.get("letterSpacing", 0)) * CSS_PX_TO_PT * run_scale,
+            run_data.get("textDecoration"),
+        )
         if run_is_gradient and run_bg_image:
             _apply_gradient_text(r, run_bg_image)
 
@@ -2011,27 +1601,27 @@ def _render_measured_element(
     has_left_accent = (
         el.get("borderLeftWidth", 0) > 0
         and el.get("borderLeftStyle") not in (None, "none")
-        and bool(_css_color_to_rgb(el.get("borderLeftColor", "")))
+        and bool(css_color_to_rgb(el.get("borderLeftColor", "")))
     )
 
     # Backdrop handed to descendants for alpha flattening: an element with its own
     # background (e.g. a navy card on a cream slide) becomes the backdrop for its
     # children, so a translucent pill inside it flattens over navy, not the slide.
     child_backdrop = backdrop
-    _bgc = _css_color_to_rgb(el.get("backgroundColor", ""))
+    _bgc = css_color_to_rgb(el.get("backgroundColor", ""))
     if _bgc is not None:
         _c, _a = _bgc
         eff = _a * opacity
         child_backdrop = (
             _c if eff >= 0.999 or backdrop is None
-            else _blend_over(_c, eff, backdrop)
+            else blend_over(_c, eff, backdrop)
         )
     elif has_gradient:
         _gc = _first_gradient_color(el.get("backgroundImage", ""))
         if _gc is not None:
             child_backdrop = _gc
 
-    if (is_image or el.get("isSvg")) and el.get("src", "").startswith("data:image/"):
+    if is_image and (el.get("src") or "").startswith("data:image/"):
         pic = _add_image_from_data_uri(
             slide, el["src"],
             Inches(x_in), Inches(y_in),
@@ -2046,24 +1636,24 @@ def _render_measured_element(
         )
         if pic is not None:
             _apply_rotation(pic, el)
+            apply_element_shadow(pic, el)
         return
 
-    # Unreasterized SVGs: skip (no python-pptx SVG support)
-    if el.get("isSvg"):
+    # A subtree the raster pass could not capture (no python-pptx SVG support).
+    if is_image or el.get("isSvg") or el.get("rasterMode") == "subtree":
+        logger.warning("Dropping uncaptured <%s> on the slide", el.get("tag"))
         return
 
-    # conic-gradient (pie/donut) — rasterize to a picture, then draw children
-    # (e.g. the center hole + label) on top.
-    if "conic-gradient" in (el.get("backgroundImage") or ""):
-        _render_conic_gradient(slide, el, x_in, y_in, w_in, h_in)
-        for child in children:
-            _render_measured_element(slide, child, child_backdrop, opacity)
-        return
+    if el.get("paintSrc"):
+        _add_paint_picture(slide, el, opacity)
+        if el.get("paintBackdrop"):
+            child_backdrop = RGBColor(*el["paintBackdrop"])
 
     if has_inline_runs:
         if has_visual_bg or has_border or has_left_accent:
             _render_bg_shape(slide, el, x_in, y_in, w_in, h_in, opacity, backdrop)
         _render_inline_runs(slide, el, x_in, y_in, w_in, h_in, has_visual_bg, opacity, backdrop)
+        render_side_borders(slide, el, child_backdrop)
         for child in children:
             if child.get("tag") not in (
                 "span", "strong", "em", "b", "i", "a", "code", "mark",
@@ -2098,6 +1688,7 @@ def _render_measured_element(
             slide, el, x_in, y_in, w_in, h_in, has_visual_bg, opacity, backdrop,
             extra_left_px,
         )
+        render_side_borders(slide, el, child_backdrop)
         # Render the decorative, text-free children themselves (e.g. bullet dots).
         for child in children:
             _render_measured_element(slide, child, child_backdrop, opacity)
@@ -2105,9 +1696,23 @@ def _render_measured_element(
 
     if has_visual_bg or has_border or has_left_accent:
         _render_bg_shape(slide, el, x_in, y_in, w_in, h_in, opacity, backdrop)
+    render_side_borders(slide, el, child_backdrop)
 
     for child in children:
         _render_measured_element(slide, child, child_backdrop, opacity)
+
+
+def _add_paint_picture(slide, target: dict, opacity: float) -> None:
+    """Place a raster-pass capture of an element's (or slide's) own paint."""
+    box = target["paintBox"]
+    pic = _add_image_from_data_uri(
+        slide, target["paintSrc"],
+        Inches(box["x"] * PIXELS_TO_INCHES_X), Inches(box["y"] * PIXELS_TO_INCHES_Y),
+        Inches(box["width"] * PIXELS_TO_INCHES_X), Inches(box["height"] * PIXELS_TO_INCHES_Y),
+        opacity=opacity,
+    )
+    if pic is not None:
+        _apply_rotation(pic, target)
 
 
 # ---------------------------------------------------------------------------
@@ -2115,50 +1720,21 @@ def _render_measured_element(
 # ---------------------------------------------------------------------------
 
 
-def _walk_elements(elements: list[dict]):
-    """Yield every element in a measurement tree (depth-first)."""
-    for el in elements:
-        yield el
-        yield from _walk_elements(el.get("children", []))
+# Pre-0.4 name, still imported by consumers that run EXTRACTION_JS on their own
+# page (e.g. a remote browser) and pin html-to-pptx with only a lower bound.
+_rasterize_inline_svgs = rasterize_marked_elements
 
 
-async def _rasterize_inline_svgs(page, measurements: list[dict]) -> None:
-    """Screenshot inline <svg> elements and patch them as raster images.
+async def extract_from_page(page) -> list[dict]:
+    """Measure a deck already loaded in ``page`` and capture non-native paint.
 
-    SVGs can't be added directly to python-pptx. This second pass shows
-    each slide, finds marked SVGs, screenshots them at 2x, and converts
-    the measurement to an image element.
+    For callers that own the browser (remote sandboxes, existing sessions). The
+    page should have a 1920×1080 viewport and be fully loaded.
     """
-    for i, slide_data in enumerate(measurements):
-        svg_els = [e for e in _walk_elements(slide_data.get("elements", []))
-                   if e.get("isSvg") and e.get("svgId")]
-        if not svg_els:
-            continue
-
-        await page.evaluate(f"""
-            document.querySelectorAll('.slide').forEach((s, idx) => {{
-                s.style.display = idx === {i} ? 'flex' : 'none';
-                if (idx === {i}) s.classList.add('active');
-                else s.classList.remove('active');
-            }});
-        """)
-        await page.wait_for_timeout(200)
-
-        for el in svg_els:
-            try:
-                handle = await page.query_selector(
-                    f'[data-pptx-id="{el["svgId"]}"]'
-                )
-                if not handle:
-                    continue
-                png_bytes = await handle.screenshot(type="png")
-                encoded = base64.b64encode(png_bytes).decode()
-                el["isImage"] = True
-                el["isSvg"] = False
-                el["src"] = f"data:image/png;base64,{encoded}"
-                el["children"] = []
-            except Exception:
-                logger.debug("Failed to rasterize SVG %s", el.get("svgId", "?"))
+    await page.evaluate("document.fonts.ready.then(() => null)")
+    measurements = await page.evaluate(EXTRACTION_JS)
+    await rasterize_marked_elements(page, measurements)
+    return measurements
 
 
 async def extract_measurements(html_path: str) -> list[dict]:
@@ -2198,6 +1774,7 @@ async def extract_measurements(html_path: str) -> list[dict]:
                 "width": SLIDE_CANVAS_WIDTH_PX,
                 "height": SLIDE_CANVAS_HEIGHT_PX,
             },
+            device_scale_factor=RASTER_DEVICE_SCALE_FACTOR,
         )
 
         await page.goto(
@@ -2205,12 +1782,8 @@ async def extract_measurements(html_path: str) -> list[dict]:
             wait_until="networkidle",
             timeout=PLAYWRIGHT_TIMEOUT_MS,
         )
-        await page.wait_for_timeout(FONT_LOAD_WAIT_MS)
-
-        measurements = await page.evaluate(EXTRACTION_JS)
-
-        await _rasterize_inline_svgs(page, measurements)
-
+        await page.wait_for_timeout(SCRIPT_SETTLE_MS)
+        measurements = await extract_from_page(page)
         await browser.close()
 
     if not measurements:
@@ -2218,9 +1791,7 @@ async def extract_measurements(html_path: str) -> list[dict]:
             'No slides found. Ensure the HTML contains <section class="slide"> elements.'
         )
 
-    total_elements = sum(
-        _count_elements(s.get("elements", [])) for s in measurements
-    )
+    total_elements = sum(count_elements(s.get("elements", [])) for s in measurements)
     logger.info(
         "Extracted %d slides, %d total elements", len(measurements), total_elements,
     )
@@ -2242,7 +1813,7 @@ def _overlay_paint(el: dict) -> tuple[int, int, int, float] | None:
             b = sum(c[2] for c, _, _ in grad) // n
             a = sum(al for _, _, al in grad) / n
             return (r, g, b, a) if a < 0.985 else None
-    bg = _css_color_to_rgb(el.get("backgroundColor", ""))
+    bg = css_color_to_rgb(el.get("backgroundColor", ""))
     if bg and bg[1] < 0.985:
         return (bg[0][0], bg[0][1], bg[0][2], bg[1])
     return None
@@ -2281,7 +1852,7 @@ def _bake_full_bleed_overlays(slide_data: dict) -> None:
     except Exception:
         return
 
-    order = list(_walk_elements(slide_data.get("elements", [])))
+    order = list(walk_elements(slide_data.get("elements", [])))
     images = [e for e in order if e.get("isImage") and str(e.get("src", "")).startswith("data:image/")]
     if not images:
         return
@@ -2336,17 +1907,22 @@ def render_pptx(measurements: list[dict]) -> Presentation:
             slide.background.fill.gradient()
             _apply_gradient_fill(slide.background._element, gradient_css)
         else:
-            bg_result = _css_color_to_rgb(slide_data.get("backgroundColor", ""))
+            bg_result = css_color_to_rgb(slide_data.get("backgroundColor", ""))
             if bg_result:
                 bg_color, _ = bg_result
                 fill = slide.background.fill
                 fill.solid()
                 fill.fore_color.rgb = bg_color
 
+        if slide_data.get("paintSrc"):
+            _add_paint_picture(slide, slide_data, opacity=1.0)
         _bake_full_bleed_overlays(slide_data)
         backdrop = _resolve_backdrop(slide_data)
         for el in slide_data.get("elements", []):
             _render_measured_element(slide, el, backdrop)
+        suppress_theme_shadows(slide)
+        if slide_data.get("notes"):
+            slide.notes_slide.notes_text_frame.text = slide_data["notes"]
 
     return prs
 

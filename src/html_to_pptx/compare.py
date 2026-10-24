@@ -33,49 +33,30 @@ SLIDE_HEIGHT_PX = 1080
 
 
 async def screenshot_html_slides(html_path: Path, out_dir: Path) -> list[Path]:
-    """Screenshot each <section class="slide"> in the HTML file."""
+    """Screenshot each slide, revealed exactly the way the converter reveals it."""
     from playwright.async_api import async_playwright
 
-    abs_path = str(html_path.resolve())
-    screenshots: list[Path] = []
+    from html_to_pptx.converter import SCRIPT_SETTLE_MS
+    from html_to_pptx.extraction_js import EXTRACTION_JS
 
+    screenshots: list[Path] = []
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(
             viewport={"width": SLIDE_WIDTH_PX, "height": SLIDE_HEIGHT_PX},
         )
         await page.goto(
-            f"file://{abs_path}", wait_until="networkidle", timeout=30_000,
+            html_path.resolve().as_uri(), wait_until="networkidle", timeout=30_000,
         )
-        await page.wait_for_timeout(1000)
-
-        slide_count = await page.evaluate(
-            "document.querySelectorAll('.slide').length"
-        )
-        if slide_count == 0:
-            logger.warning("No .slide sections found in %s", html_path.name)
-            await browser.close()
-            return screenshots
-
-        for i in range(slide_count):
-            await page.evaluate(
-                """(idx) => {
-                    document.querySelectorAll('.slide').forEach((s, i) => {
-                        s.style.display = i === idx ? 'flex' : 'none';
-                        if (i === idx) s.classList.add('active');
-                        else s.classList.remove('active');
-                    });
-                }""",
-                i,
-            )
-            await page.wait_for_timeout(200)
-
+        await page.wait_for_timeout(SCRIPT_SETTLE_MS)
+        slides = await page.evaluate(EXTRACTION_JS)
+        for i in range(len(slides)):
+            await page.evaluate("idx => window.__htmlToPptx.prepareSlide(idx)", i)
             out_path = out_dir / f"html_slide_{i}.png"
             await page.screenshot(path=str(out_path), full_page=False)
+            await page.evaluate("() => window.__htmlToPptx.finishSlide()")
             screenshots.append(out_path)
-
         await browser.close()
-
     return screenshots
 
 
@@ -105,7 +86,7 @@ def pptx_to_pngs(pptx_path: Path, out_dir: Path) -> list[Path]:
         return []
 
     try:
-        import fitz  # PyMuPDF
+        import pymupdf
     except ImportError:
         logger.error(
             "PyMuPDF not installed. Run: pip install html-to-pptx[compare]"
@@ -113,10 +94,10 @@ def pptx_to_pngs(pptx_path: Path, out_dir: Path) -> list[Path]:
         return []
 
     pngs: list[Path] = []
-    doc = fitz.open(str(pdf_path))
+    doc = pymupdf.open(str(pdf_path))
     for i in range(len(doc)):
         page = doc[i]
-        mat = fitz.Matrix(2, 2)
+        mat = pymupdf.Matrix(2, 2)
         pix = page.get_pixmap(matrix=mat)
         png_path = out_dir / f"pptx_slide_{i}.png"
         pix.save(str(png_path))

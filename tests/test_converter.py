@@ -2,13 +2,26 @@
 
 from __future__ import annotations
 
+import base64
+import io
 from pathlib import Path
 
 import pytest
+from PIL import Image
 from pptx import Presentation
 from pptx.util import Inches
 
 from html_to_pptx import convert, extract_measurements, render_pptx
+from html_to_pptx.measurement_tree import walk_elements
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+SVG_RING_RGB = (0x38, 0xBD, 0xF8)
+SVG_FADED_RGB = (0xF9, 0x73, 0x16)
+SVG_RING_STROKE_CENTER_PX = 60  # stroke spans 18-102px of the 600px donut box
+
+
+def _decode_png(src: str) -> Image.Image:
+    return Image.open(io.BytesIO(base64.b64decode(src.split(",", 1)[1]))).convert("RGBA")
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +51,24 @@ async def test_empty_html_raises(tmp_path: Path):
     empty.write_text("<html><body></body></html>")
     with pytest.raises(ValueError, match="No slides found"):
         await extract_measurements(str(empty))
+
+
+@pytest.mark.asyncio
+async def test_inline_svg_raster_holds_only_the_svg():
+    """HTML overlaid on an SVG is exported as its own text box, so baking it into
+    the SVG picture too renders it twice (the "shadow text" bug)."""
+    measurements = await extract_measurements(str(FIXTURES_DIR / "svg_overlay.html"))
+    donut, faded = [e for e in walk_elements(measurements[0]["elements"]) if e.get("isImage")]
+
+    ring = _decode_png(donut["src"])
+    center = (ring.width // 2, ring.height // 2)
+    assert ring.getpixel(center)[3] == 0, "overlaid label leaked into the SVG raster"
+    assert ring.getpixel((0, 0))[3] == 0, "slide background leaked into the SVG raster"
+    assert ring.getpixel((SVG_RING_STROKE_CENTER_PX, center[1])) == (*SVG_RING_RGB, 255)
+
+    # render_pptx applies opacity to the picture, so the raster must not pre-blend it.
+    assert faded["opacity"] == 0.5
+    assert _decode_png(faded["src"]).getpixel((0, 0)) == (*SVG_FADED_RGB, 255)
 
 
 # ---------------------------------------------------------------------------

@@ -22,3 +22,8 @@ def tmp_pptx(tmp_path: Path) -> Path:
 async def minimal_measurements() -> list[dict]:
     """Extract measurements once per test session — avoids repeated browser launches."""
     return await extract_measurements(str(FIXTURES_DIR / "minimal.html"))
+
+
+@pytest_asyncio.fixture(scope="session")
+async def fidelity_measurements() -> list[dict]:
+    return await extract_measurements(str(FIXTURES_DIR / "fidelity.html"))

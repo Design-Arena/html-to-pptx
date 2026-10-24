@@ -50,9 +50,20 @@ async def main():
 asyncio.run(main())
 ```
 
+### Measuring a page you already control
+
+If you already drive Playwright (custom viewport, auth, injected data), measure the loaded page directly. Fonts are awaited, animations settled, and non-native paint rasterized in the same page:
+
+```python
+from html_to_pptx import extract_from_page, render_pptx
+
+measurements = await extract_from_page(page)
+render_pptx(measurements).save("deck.pptx")
+```
+
 ## HTML format
 
-Your HTML file should contain `<section class="slide">` elements at a 1920×1080 canvas:
+Slides are discovered the way common deck frameworks expose them: `.slide` elements first, then reveal.js-style `.slides > section`, then any `section`, then the children of a `#deck`/`.deck`/`.slides` container. Each slide is revealed by removing inline `display:none` and adding the `active`/`present`/`current` classes, so your own `.slide.active { display: grid }` rules keep working. A 1920×1080 canvas is expected:
 
 ```html
 <!DOCTYPE html>
@@ -101,10 +112,16 @@ See [`examples/demo.html`](examples/demo.html) for a full five-slide deck.
 | **Text/box/gradient alpha** | Flattened over the correct backdrop (nearest ancestor bg), so translucency renders in every viewer |
 | **Translucent image overlays / scrims** | Baked into the underlying image so the photo stays visible |
 | **Mixed inline content** (`<p>text <strong>bold</strong> more</p>`) | Multi-run paragraphs with per-run styling |
-| **CSS linear-gradient backgrounds** | OOXML gradient fills with angle and stop positions |
-| **CSS `conic-gradient`** (pies/donuts) | Rasterized to a picture with true segments |
+| **CSS `linear-gradient` backgrounds** | OOXML gradient fills with angle (`deg`/`turn`/`rad`/`grad`), exact stop positions, hard stops and double-position stops |
+| **Paint PPTX can't express** (radial/conic/repeating/layered gradients, `background-image: url()`, glows, `filter`, `clip-path`, `mask`, decorative `::before`/`::after`) | Only the element's own paint is screenshotted by Chromium and placed underneath — its **text and children stay native and editable** |
+| **`box-shadow`** | Native OOXML outer shadow (blur, offset, spread, alpha); layered shadows use the dominant layer |
 | **Gradient text** (`-webkit-background-clip: text`) | Gradient text fill with a solid first-stop fallback |
-| **Inline `<svg>` elements** | Rasterized to PNG via Playwright screenshot |
+| **Inline `<svg>`, `<canvas>`, `<video>`, `<iframe>`** | Pixel-exact picture captured in isolation at 2× device scale |
+| **Any `<img>`** (WebP, AVIF, SVG, remote, relative URLs) | Native picture; non-PPTX formats are captured or transcoded to PNG |
+| **`letter-spacing`, `text-decoration`** | Run character spacing, underline, strikethrough |
+| **Per-side borders** (`border-bottom` dividers, table row rules) | Thin bars at the exact side and width |
+| **CSS animations/transitions** | Settled to their final state before measuring, so fade-ins aren't captured mid-flight |
+| **Speaker notes** (`<aside class="notes">` or `data-pptx-notes`) | PowerPoint speaker notes |
 | **HTML tables** (`<table>`) | Cell-accurate text with per-column alignment preserved |
 | Background colors | Solid fills (with alpha flattening) |
 | Rounded corners (`border-radius`, including `%`) | OOXML adjustment guides on rounded rectangles |
@@ -135,13 +152,17 @@ HTML file
 │  Headless Chromium       │  ← Playwright loads the HTML at 1920×1080
 │  (Playwright)            │
 │                          │
-│  For each .slide:        │
-│  • Show slide in isolation│
+│  For each slide:         │
+│  • Reveal it, settle     │
+│    animations            │
 │  • Clear CSS transforms  │
 │  • Measure every visible │
 │    element recursively:  │
 │    position, size, color,│
 │    font, text, images    │
+│  • Screenshot paint PPTX │
+│    can't express, in     │
+│    isolation             │
 └───────────┬─────────────┘
             │
             ▼
@@ -191,10 +212,9 @@ results/deck/
 
 ## Limitations
 
-- **External images** are not fetched — use base64 `data:` URIs for embedded images
-- **CSS `background-image: url(...)`** on containers is not converted — only `<img>` tags with base64 `src` and inline `<svg>` elements become picture shapes
-- **Radial / multi-layered gradients** are not drawn — they fall back to the solid background color (single `linear-gradient` and `conic-gradient` are supported)
-- **Animations and transitions** are not represented in PPTX
+- **Rasterized paint is a picture** — radial gradients, glows, `url()` backgrounds and SVG/canvas content look exact but can't be restyled in PowerPoint (text on top of them stays editable)
+- **Inset and multi-layer shadows** — OOXML allows one outer shadow per shape; inset layers are dropped
+- **Animations and transitions** are not represented in PPTX — each slide shows its final, settled state
 - **Font availability** — web fonts are mapped to a metric-compatible font in the same family (serif→Georgia, humanist sans→Segoe UI, geometric sans→Century Gothic, mono→Consolas, …). For pixel-exact display type, embed the font in PowerPoint yourself
 - **Complex CSS layouts** (grid, advanced flexbox) are measured as-rendered, but deeply nested layouts may lose some positioning precision
 

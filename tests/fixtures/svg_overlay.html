@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; }
+  .slide { width: 1920px; height: 1080px; display: none; position: relative; background: #0f172a; font-family: sans-serif; }
+  .slide.active { display: flex; }
+  .donut { position: absolute; left: 200px; top: 200px; width: 600px; height: 600px; }
+  .donut svg { width: 600px; height: 600px; }
+  .donut .label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 140px; font-weight: 800; color: #f8fafc; }
+  .faded { position: absolute; left: 1100px; top: 300px; opacity: 0.5; }
+</style>
+</head>
+<body>
+<section class="slide active">
+  <div class="donut">
+    <svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="40" fill="none" stroke="#38bdf8" stroke-width="14"/></svg>
+    <div class="label">72%</div>
+  </div>
+  <svg class="faded" width="400" height="400" viewBox="0 0 10 10"><rect width="10" height="10" fill="#f97316"/></svg>
+</section>
+<section class="slide"><h1 style="color: #fff;">Second</h1></section>
+</body>
+</html>

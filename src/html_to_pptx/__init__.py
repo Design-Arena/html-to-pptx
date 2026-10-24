@@ -14,11 +14,20 @@ Or use the two-stage API for more control::
     measurements = asyncio.run(extract_measurements("deck.html"))
     prs = render_pptx(measurements)
     prs.save("deck.pptx")
+
+If you already drive a browser, measure a loaded page directly::
+
+    measurements = await extract_from_page(page)
 """
 
 from importlib.metadata import version
 
-from html_to_pptx.converter import convert, extract_measurements, render_pptx
+from html_to_pptx.converter import (
+    convert,
+    extract_from_page,
+    extract_measurements,
+    render_pptx,
+)
 
-__all__ = ["convert", "extract_measurements", "render_pptx"]
+__all__ = ["convert", "extract_from_page", "extract_measurements", "render_pptx"]
 __version__ = version("html-to-pptx")
