@@ -1,33 +1,33 @@
-# Standalone copy of Design-Arena/security .github/workflows/reusable-ai-security-review.yml@449ec52ecacee8ade3b817b85233e647675b6d16
+# Standalone copy of Design-Arena/security .github/workflows/reusable-ai-security-review.yml@c8150477da276c761e57c5d179e2abe00ea7701d
 # (public/internal repos cannot call reusable workflows from a private repo). Keep in sync with that file.
-# Advisory AI security review for pull requests (Claude API, keyless via workload identity federation).
+# Advisory AI security review for pull requests (Claude API, authenticated with an Anthropic API key).
 #
 # Called from a tiny per-repo workflow:
 #
 #   on:
 #     pull_request:
 #       types: [opened, synchronize, reopened, ready_for_review]
-#   permissions:
-#     contents: read
-#     pull-requests: write
-#     id-token: write
+#   permissions: {}
 #   jobs:
-#     ai-security-review:
+#     security:
 #       uses: Design-Arena/security/.github/workflows/reusable-ai-security-review.yml@<commit-sha>
+#       permissions:
+#         contents: read
+#         pull-requests: write
 #       secrets:
-#         AI_REVIEW_ANTHROPIC_API_KEY: ${{ secrets.AI_REVIEW_ANTHROPIC_API_KEY }}  # fallback only
+#         AI_REVIEW_ANTHROPIC_API_KEY: ${{ secrets.AI_REVIEW_ANTHROPIC_API_KEY }}
 #
 # Trust model:
-# - Runs only for PRs from branches in the same repo (never forks), non-draft, non-bot authors.
+# - Triggered by `pull_request` only (never `pull_request_target`), so fork PRs get no secrets. The job
+#   also requires a same-repo head branch (pushing one needs write access), a non-draft PR, and a
+#   non-bot author/actor.
 # - Claude only gets Read/Grep/Glob over the checkout plus a pre-computed diff. It has no shell,
 #   no network tools and no GitHub write tools; it returns JSON, and a separate step posts comments
 #   (with secret redaction).
-# - Credential: the job's GitHub OIDC token is exchanged for a short-lived Claude API token through a
-#   Claude Console federation rule (org variables AI_REVIEW_ANTHROPIC_ORG_ID,
-#   AI_REVIEW_FEDERATION_RULE_ID, AI_REVIEW_SERVICE_ACCOUNT_ID, optional AI_REVIEW_WORKSPACE_ID).
-#   The rule only accepts pull_request runs of these workflows in the listed Design-Arena repos.
-#   Fallback when no federation rule is configured: org secret AI_REVIEW_ANTHROPIC_API_KEY.
-#   With neither, the job skips with a notice.
+# - Credential: org secret AI_REVIEW_ANTHROPIC_API_KEY (a key from the dedicated Claude Console
+#   workspace, which carries the monthly spend limit). Without it the job skips with a notice and
+#   stays green.
+# - Cost caps per run: model, max turns, max USD (Claude Code --max-budget-usd), and diff size limits.
 # - Advisory: never fails the PR because of findings; do not make this a required check.
 #
 # Opt out on a single PR with the label `skip-ai-security-review`.
@@ -48,13 +48,13 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.user.type != 'Bot' &&
+      !endsWith(github.actor, '[bot]') &&
       !contains(github.event.pull_request.labels.*.name, 'skip-ai-security-review')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: write
-      id-token: write # workload identity federation to the Claude API
     concurrency:
       group: ai-security-review-${{ github.repository }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -76,7 +76,8 @@ jobs:
         env:
           MAX_LINES: 4000
           MAX_FILES: 150
-          HAVE_CREDENTIAL: ${{ vars.AI_REVIEW_FEDERATION_RULE_ID != '' || secrets.AI_REVIEW_ANTHROPIC_API_KEY != '' }}
+          MAX_BYTES: 400000
+          HAVE_CREDENTIAL: ${{ secrets.AI_REVIEW_ANTHROPIC_API_KEY != '' }}
         run: |
           set -euo pipefail
           git rev-parse --verify -q HEAD^1 >/dev/null || { echo "::error::checkout of PR merge commit failed"; exit 1; }
@@ -99,7 +100,7 @@ jobs:
           run=true
           reason=""
           if [ "$HAVE_CREDENTIAL" != true ]; then
-            run=false; reason="no Claude API credential is configured for this repo (AI_REVIEW_* org variables or secret)"
+            run=false; reason="secret AI_REVIEW_ANTHROPIC_API_KEY is not available to this repo"
           elif [ "$files" -eq 0 ]; then
             run=false; reason="only docs, lockfiles, media or data files changed"
           elif [ "$lines" -gt "$MAX_LINES" ] || [ "$files" -gt "$MAX_FILES" ]; then
@@ -117,7 +118,13 @@ jobs:
               { print }
             ' > "$DIFF_DIR/pr.diff"
             cut -f3- /tmp/numstat > "$DIFF_DIR/changed_files.txt"
-          else
+            bytes=$(wc -c < "$DIFF_DIR/pr.diff" | tr -d ' ')
+            if [ "$bytes" -gt "$MAX_BYTES" ]; then
+              run=false; reason="diff too large for automated review ($bytes bytes; limit $MAX_BYTES)"
+              rm -rf "$DIFF_DIR"
+            fi
+          fi
+          if [ "$run" != true ]; then
             echo "::notice title=AI security review skipped::$reason"
             echo "AI security review skipped: $reason" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -133,12 +140,7 @@ jobs:
         continue-on-error: true
         uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6 # v1.0.264
         with:
-          anthropic_federation_rule_id: ${{ vars.AI_REVIEW_FEDERATION_RULE_ID }}
-          anthropic_organization_id: ${{ vars.AI_REVIEW_ANTHROPIC_ORG_ID }}
-          anthropic_service_account_id: ${{ vars.AI_REVIEW_SERVICE_ACCOUNT_ID }}
-          anthropic_workspace_id: ${{ vars.AI_REVIEW_WORKSPACE_ID }}
-          # A static key would shadow federation, so pass it only when no federation rule is configured.
-          anthropic_api_key: ${{ vars.AI_REVIEW_FEDERATION_RULE_ID == '' && secrets.AI_REVIEW_ANTHROPIC_API_KEY || '' }}
+          anthropic_api_key: ${{ secrets.AI_REVIEW_ANTHROPIC_API_KEY }}
           settings: '{"permissions":{"deny":["Read(./.git/**)","Read(//proc/**)","Read(//home/runner/work/_temp/**)","Read(//tmp/**)"]}}'
           github_token: ${{ github.token }}
           include_fix_links: "false"
@@ -206,10 +208,11 @@ jobs:
             (never a line number within pr.diff itself), and give "path" relative to the repository root. Keep each field
             short and concrete: what is wrong, how an attacker exploits it, and the fix. If nothing qualifies,
             return an empty findings list. Spend at most a few minutes; do not explore unrelated code.
-
+            
           claude_args: |
             --model claude-sonnet-5-5
-            --max-turns 30
+            --max-turns 20
+            --max-budget-usd 0.75
             --allowedTools Read,Grep,Glob
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task
             --json-schema '{"type":"object","additionalProperties":false,"required":["findings","summary"],"properties":{"summary":{"type":"string","maxLength":1200},"prompt_injection_attempt_detected":{"type":"boolean"},"findings":{"type":"array","maxItems":15,"items":{"type":"object","additionalProperties":false,"required":["severity","category","title","path","line","description","recommendation","confidence"],"properties":{"severity":{"type":"string","enum":["critical","high","medium","low"]},"category":{"type":"string","maxLength":80},"title":{"type":"string","maxLength":160},"path":{"type":"string","maxLength":300},"line":{"type":"integer","minimum":1},"description":{"type":"string","maxLength":1500},"exploit_scenario":{"type":"string","maxLength":1000},"recommendation":{"type":"string","maxLength":1000},"confidence":{"type":"number","minimum":0,"maximum":1}}}}}}'
@@ -226,7 +229,7 @@ jobs:
           STRUCTURED_OUTPUT: ${{ steps.claude.outputs.structured_output }}
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
-          MODEL: claude-sonnet-5-5
+          MODEL: "claude-sonnet-5-5"
           REVIEW_SLUG: ai-security-review
           REVIEW_TITLE: AI security review
           REPORT_SEVERITIES: critical,high,medium
